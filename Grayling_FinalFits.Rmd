@@ -1,0 +1,242 @@
+---
+title: "Grayling_FinalFits"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library("hypergeo")
+library(stats)
+```
+
+This code takes data from various experimental conditions and fits the eDNA and eRNA decay model for the shedding and decay rates.
+This model fits individual shedding rates (S) and decay rate (k) for each animal within an experiment.
+NOTE: In all cases, we fit the log of S and k rather than S and k directly, in order to force these values to stay positive.
+## Experiment types:
+  eDNA shedding and decay at different flow rates. This is fit using maximum likelihood because of the discontinuity of the function.
+  eDNA and eRNA shedding and decay in a static tank. These are fit using a non-linear least squares fitting.
+
+# DIFFERENT FLOW RATES
+
+Load data from an experiment with different flow rates
+Variables: Fish (e.g. 1-4), Time (Hours) (i.e. when the eDNA was sampled), Copies/L (can be changed to just Copies) 
+
+## Define the model. 
+In this case, we define separate sections of the output where the flow rate is constant.
+
+Variables to alter:
+  tl = duration of each flow rate [example = 120]min
+  v = volume of water [example = 285]L
+  uvec = each flow rate used in the experiment [example = c(1,5,10,20)/v]L/min
+  s <- ps[1:4] = shedding rate parameters for the # of animals in experiment [example = 4]
+  k <- pk[1:4] = decay rate for each fish
+
+We then define the starting concentration (C0) at each segment according to the end concentration at the previous flow rate.
+
+```{r flow rate definitions}
+
+fr_data <- read.csv(paste("eDNA_Data.xlsx - FlowRate Data.csv",sep=""), header=TRUE)
+
+# Define model
+fr_model <- function(t,s,k,c0emp){
+    # This is the amount of time between when the velocities were changes
+    tl <- 2 # Hours
+    # This is the total volume
+    v <- 285 # L
+    # These are the empirical velocities, changed into flow rates by dividing by volume
+    uvec <- c(1,5,10,20)/v*60 # To convert to hours
+    # Take the exponent to ensure these stay positive, since negatives don't make sense biologically
+    es <- exp(s)
+    ek <- exp(k)
+    # Define concentration c0 and constant term in solution c0'
+    c0 <- c(0,0,0,0)
+    c0p <- c(0,0,0,0)
+    # Loop to define these
+    for (i in c(0,1,2,3)){
+        # Note: Set c0 to empirical value at 0
+        c0[i+1] <- ifelse(i==0, c0emp, exp(-(ek+uvec[i])*tl)*c0p[i] + es/v/(ek+uvec[i]))
+        # This is the value at the start of each segment of constant velocity
+        c0p[i+1] <- ifelse(i==0, c0[1] - es/v/(ek+uvec[1]), c0[i+1] - es/v/(ek+uvec[i+1]))
+    }
+    # Now get return variable. The ifelse statement find which segment of the solution we are on.
+    # In other words, what the velocity of the water is.
+    ct <- ifelse(t<=tl,exp(-(ek+uvec[1])*t)*c0p[1]+es/v/(ek+uvec[1]),
+                ifelse(t<=2*tl,exp(-(ek+uvec[2])*(t-tl))*c0p[2]+es/v/(ek+uvec[2]),
+                ifelse(t<=3*tl,exp(-(ek+uvec[3])*(t-2*tl))*c0p[3]+es/v/(ek+uvec[3]),
+                       exp(-(ek+uvec[4])*(t-3*tl))*c0p[4]+es/v/(ek+uvec[4]))))
+}
+
+# Define the log likelihood function.
+ll_fr <- function(pa,dft){
+    # pa are parameters, df is data for a single fish
+    # Shed rates
+    s <- pa[1] # One for each fish
+    # Decay rate
+    k <- pa[2] # One for each fish
+    times <- dft[dft$Hours>0,'Hours']
+    vals <- dft[dft$Hours>0,'Copies1Lsc']
+    c0 <- dft[dft$Hours==0,'Copies1Lsc']
+    mod <- fr_model(times,s,k,c0)
+    logpmf <- -mod + vals*log(mod)-lgamma(vals+1)
+    ll <- -sum(logpmf)
+    return(ll)
+}
+
+# Now use optimize to get the optimal values for the shed rates and the decay rate, and print them out
+# The par values are just initial guesses for the values of the shed rates and decay rates
+# but note they are the log of the actual values since we transform them by taken the exponent in the fr_model function
+df <- split(fr_data,fr_data$Organism)
+# Make storage for shed and decay rates
+ps <- rep(0,length(df))
+pk <- rep(0,length(df))
+for (i in 1:length(df)){
+  dft<-df[[i]]
+  fr_opt <- optim(par=c(11,-23),ll_fr,dft=dft)
+  ps[[i]]<-fr_opt$par[1]
+  pk[[i]]<-fr_opt$par[2]
+}
+print("Optimization results from flow rate experiment")
+exp(ps)
+exp(pk)
+# Save to files
+write.csv(data.frame(s=exp(ps),k=exp(pk)),"flow_rate_fits.csv", row.names = FALSE)
+```
+# STATIC TANK EXPERIMENT
+In this experiment, a fish was introduced in the tank, and then removed after a certain time.
+
+## Define the necessary functions
+  t_sc = time the animal was removed from the environment (230 min here)
+  s <- shedding rate
+  k <- decay rate
+  
+Define the model for the copies
+```{r define static tank}
+# Read in data
+sc_data <- read.csv(paste("eDNA_Data.xlsx - Static.csv"))
+# Separate by fish
+sc_individual <- split(sc_data,sc_data$BioRep)
+
+t_sc <- 230/60 #in hours
+sc_model <- function(t,s,k,c0emp,pv){
+    # Exponent of s and k to force positive
+    es <- exp(s)
+    ek <- exp(k)
+    # This term depends on what the time is. After the fish is removed at t=t_sc, the shed rate is 0.
+    # The form of the function here is fairly complicated because of the volume function, for which the parameters
+    # given by pv. 
+    hypt1 <- ifelse(t<=t_sc,exp((pv[2]+ek)*t)*hypergeo(1,1+ek/pv[2],2+ek/pv[2],-pv[3]*exp(pv[2]*t)/pv[1]),
+                exp((pv[2]+ek)*t_sc)*hypergeo(1,1+ek/pv[2],2+ek/pv[2],-pv[3]*exp(pv[2]*t_sc)/pv[1]))
+    hypt2 <- hypergeo(1,1+ek/pv[2],2+ek/pv[2],-pv[3]/pv[1])
+    hypt <- Re((hypt1-hypt2)/(pv[1]*(pv[2]+ek)))
+    return(exp(-ek*t)*(c0emp+hypt*es))
+}
+
+#Now we have to get the function for how the volume decays
+
+# Get all coefficients for parameters, one for each Organism
+pvs <- Map(nls,sc_individual, MoreArgs=list(formula = Volume ~ p1*exp(-p2 * Hours) + p3, start=list(p1=150,p2=0.0005*60,p3=350))) # p2 has time units, so 0.03 for hours, but 0.0005 for minutes
+# Save to file
+write.csv(t(data.frame(coef(pvs[[1]]),coef(pvs[[2]]),coef(pvs[[3]]),coef(pvs[[4]]))),"static_tank_fits_volume.csv",row.names = FALSE)
+```
+
+```{r static tank eDNA}
+
+sdna <- c(0,0,0,0)
+kdna <- c(0,0,0,0)
+sdna_err <- c(0,0,0,0)
+kdna_err <- c(0,0,0,0)
+
+# Loop over each fish
+for (i in 1:length(sc_individual)){
+  # Temporary data to fit
+  dft <- sc_individual[[i]]
+  # Remove NA
+  dft <- dft[complete.cases(dft$eDNA1Lsc),]
+  times <- dft[dft$Hours>0,'Hours']
+  vals <- dft[dft$Hours>0,'eDNA1Lsc']
+  c0 <- mean(dft[dft$Hours==0,'eDNA1Lsc'])
+  # Define the function to fit within the loop so that it has the appropriate values
+  sc_nls_fit <- function(s,k){
+    # s is shed rate
+    # k is decay rate
+    mod <- sc_model(times,s,k,c0,coef(pvs[[i]]))
+    return(mod)
+  }
+  # Use nls to fit. Technically this uses gaussian errors rather than Poisson
+  fit <- nls(vals ~ sc_nls_fit(s,k),start=list(s=19,k=-3))
+  # Save to file
+  sdna[i] <- exp(coef(fit))[[1]]
+  sdna_err[i] <- exp(coef(fit)[[1]])*sqrt(vcov(fit))[1,1]
+  kdna[i] <- exp(coef(fit))[[2]]
+  kdna_err[i] <- exp(coef(fit)[[2]])*sqrt(vcov(fit))[2,2]
+  # Print out
+  print("S and standard error")
+  print(sdna[i])
+  print(sdna_err[i])
+  print("k standard error")
+  print(kdna[i])
+  print(kdna_err[i])
+}
+
+# Save to file
+write.csv(data.frame(s=sdna,serr=sdna_err,k=kdna,kerr=kdna_err),"static_tank_fits_eDNA.csv",row.names=FALSE)
+```
+
+```{r static tank eRNA}
+srna <- c(0,0,0)
+krna <- c(0,0,0)
+srna_err <- c(0,0,0)
+krna_err <- c(0,0,0)
+
+for (i in 1:3){
+  # Temporary data to fit
+  dft <- sc_individual[[i]]
+  # Remove NA
+  dft <- dft[complete.cases(dft$eRNA1Lsc),]
+  times <- dft[dft$Hours>0,'Hours']
+  vals <- dft[dft$Hours>0,'eRNA1Lsc']
+  c0 <- mean(dft[dft$Hours==0,'eRNA1Lsc'])
+  # Define the function to fit
+  sc_nls_fit <- function(s,k){
+    # s is shed rate
+    # k is decay rate
+    mod <- sc_model(times,s,k,c0,coef(pvs[[i]]))
+    return(mod)
+  }
+  fit <- nls(vals ~ sc_nls_fit(s,k),start=list(s=19,k=-3))
+  # Save to file
+  srna[i] <- exp(coef(fit))[[1]]
+  srna_err[i] <- exp(coef(fit)[[1]])*sqrt(vcov(fit))[1,1]
+  krna[i] <- exp(coef(fit))[[2]]
+  krna_err[i] <- exp(coef(fit)[[2]])*sqrt(vcov(fit))[2,2]
+  # Print out
+  print("S and standard error")
+  print(srna[i])
+  print(srna_err[i])
+  print("k standard error")
+  print(krna[i])
+  print(krna_err[i])
+}
+# Save to file
+write.csv(data.frame(s=srna,serr=srna_err,k=krna,kerr=krna_err),"static_tank_fits_eRNA.csv",row.names=FALSE)
+```
+
+```{r summary}
+sdna_sum <- c(exp(ps),sdna)
+print("Mean and standard deviation of S")
+mean(sdna_sum)
+sd(sdna_sum)
+print("Mean and standard deviation of k")
+mean(kdna)
+sd(kdna)
+print("Mean and standard deviaiton of S (eRNA)")
+mean(srna)
+sd(srna)
+print("Mean and standard deviaiton of k (eRNA)")
+mean(krna)
+sd(krna)
+```

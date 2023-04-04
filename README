@@ -1,0 +1,7 @@
+This folder contains all of the code and results from fitting the data with the eDNA/eRNA decay model.
+
+The .csv files starting with eDNA_Data are the actual data measurements.
+
+These are fit in R using the .Rmd file, Grayling_FinalFits.Rmd, which additionally outputs the fit values to .csv files (those starting with lower case).
+
+These fit values are then read into python for fitting in the .ipynb notebooks, which finally outputs .pdf figures.
